@@ -38,6 +38,8 @@ createApp({
     const sludgeJobs = ref([]);
     const plantDetail = ref(null);
     const sampleDetail = ref(null);
+    const outfallDetail = ref(null);
+    const maintDecisions = ref([]);
     const reconOne = ref(null);
     const reconAllItems = ref([]);
     const proofOne = ref(null);
@@ -52,8 +54,8 @@ createApp({
       cod_limit: 50, nh3n_limit: 5, tp_limit: 0.5,
     });
     const sampleForm = ref({
-      outfall_id: 1, permit_ref: "DP-2026-E01", sample_code: "",
-      cod: 35, nh3n: 2.5, tp: 0.2, flow_m3h: 1800,
+      outfall_id: 3, permit_ref: "DP-2026-W02", sample_code: "",
+      cod: 35, nh3n: 2.5, tp: 0.2, flow_m3h: 1500,
     });
     const releaseForm = ref({ sample_id: 0, officer: "值班员" });
     const sealForm = ref({ sample_id: 0, snapshot: "" });
@@ -81,6 +83,18 @@ createApp({
     const sealableSamples = computed(() =>
       samples.value.filter((s) => ["已裁定", "已准排"].includes(s.status))
     );
+    // 采样页与处理厂页同屏互斥闸：所选排放口所属厂非「运行」即禁新建。
+    const selectedOutfall = computed(() =>
+      outfalls.value.find((o) => o.id === sampleForm.value.outfall_id) || null
+    );
+    const samplingBlocked = computed(() => {
+      const of = selectedOutfall.value;
+      return !!of && !!of.is_maintenance;
+    });
+    const selectedPlantMaintenance = computed(() => {
+      if (!plantDetail.value) return false;
+      return plantDetail.value.plant.is_maintenance === true;
+    });
 
     function statusClass(s) {
       if (!s) return "muted";
@@ -138,6 +152,7 @@ createApp({
       lineageEdges.value = (await api.lineage()).items;
       labJobs.value = (await api.labJobs()).items;
       sludgeJobs.value = (await api.sludgeJobs()).items;
+      maintDecisions.value = (await api.maintenanceDecisions()).items;
       if (!releaseForm.value.sample_id && releasableSamples.value.length) {
         releaseForm.value.sample_id = releasableSamples.value[0].id;
       }
@@ -148,9 +163,18 @@ createApp({
 
     async function loadPlant(id) { plantDetail.value = await api.plant(id); }
     async function loadSample(id) { sampleDetail.value = await api.sample(id); }
+    async function loadOutfall(id) { outfallDetail.value = await api.outfall(id); }
+    async function setPlantStatus(id, status) {
+      await flash(() => api.setPlantStatus(id, status));
+      if (plantDetail.value && plantDetail.value.plant.id === id) await loadPlant(id);
+    }
     async function createPlant() { await flash(() => api.createPlant(plantForm.value)); }
     async function createOutfall() { await flash(() => api.createOutfall(outfallForm.value)); }
     async function createSample() {
+      if (samplingBlocked.value) {
+        actionErr.value = "检修禁采：该排放口所属处理厂检修中，正式排放册拒写。";
+        return;
+      }
       await flash(() => api.createSample({
         outfall_id: sampleForm.value.outfall_id,
         permit_ref: sampleForm.value.permit_ref,
@@ -219,12 +243,14 @@ createApp({
     return {
       token, user, username, password, err, actionErr, actionOk, tab, nav,
       dash, plants, outfalls, samples, exceeds, releases, seals, permits,
-      lineageEdges, labJobs, sludgeJobs, plantDetail, sampleDetail,
+      lineageEdges, labJobs, sludgeJobs, plantDetail, sampleDetail, outfallDetail,
+      maintDecisions, selectedOutfall, samplingBlocked, selectedPlantMaintenance,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       plantForm, outfallForm, sampleForm, releaseForm, sealForm, permitForm,
       lineageForm, labForm, sludgeForm, releasableSamples, sealableSamples,
       login, logout, refresh, statusClass, sampleClass, fmtMetrics,
-      loadPlant, loadSample, createPlant, createOutfall, createSample,
+      loadPlant, loadSample, loadOutfall, createPlant, createOutfall, createSample,
+      setPlantStatus,
       closeExceed, createRelease, createSeal, createPermit, createLineage,
       loadReconcile, loadReconcileOne, loadProof, enqueueLab, enqueueSludge,
     };

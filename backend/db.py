@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS plants(
   basin TEXT NOT NULL,
   design_cap_m3d REAL NOT NULL,
   status TEXT NOT NULL,
+  maintenance_since TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS outfalls(
@@ -100,9 +101,32 @@ CREATE TABLE IF NOT EXISTS sample_batches(
   flow_m3h REAL NOT NULL,
   generation INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL,
+  maintenance_conflict INTEGER NOT NULL DEFAULT 0,
   adjudicated_at TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(outfall_id) REFERENCES outfalls(id)
+);
+CREATE TABLE IF NOT EXISTS sample_drafts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sample_code TEXT,
+  outfall_id INTEGER NOT NULL,
+  permit_ref TEXT NOT NULL,
+  metrics TEXT NOT NULL,
+  flow_m3h REAL NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(outfall_id) REFERENCES outfalls(id)
+);
+CREATE TABLE IF NOT EXISTS maintenance_decisions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plant_id INTEGER NOT NULL,
+  plant_code TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  decided_at TEXT NOT NULL,
+  sealed_on TEXT NOT NULL,
+  note TEXT,
+  FOREIGN KEY(plant_id) REFERENCES plants(id)
 );
 CREATE TABLE IF NOT EXISTS exceed_holds(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,15 +254,19 @@ def seed_plants(conn: sqlite3.Connection) -> None:
             "SELECT id FROM plants WHERE plant_code=?", (row["plant_code"],)
         ).fetchone():
             continue
+        status = row.get("status", "运行")
         conn.execute(
-            """INSERT INTO plants(plant_code,name,basin,design_cap_m3d,status,created_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO plants(plant_code,name,basin,design_cap_m3d,status,
+               maintenance_since,created_at)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 row["plant_code"],
                 row["name"],
                 row["basin"],
                 float(row["design_cap_m3d"]),
-                row.get("status", "运行"),
+                status,
+                row.get("maintenance_since")
+                or (row.get("created_at", now_iso()) if status == "检修" else None),
                 row.get("created_at", now_iso()),
             ),
         )
@@ -312,10 +340,40 @@ def seed_samples(conn: sqlite3.Connection) -> None:
         outfall = _outfall_id(conn, row["outfall_code"])
         if not outfall:
             continue
+        plant = conn.execute(
+            """SELECT p.status, p.plant_code FROM plants p
+               JOIN outfalls o ON o.plant_id=p.id WHERE o.id=?""",
+            (outfall,),
+        ).fetchone()
+        plant_status = plant["status"] if plant else "运行"
+        # 夹具里带 maintenance_conflict 标记的批次＝检修期间误采的假绿，
+        # 种子阶段即转当日拒收封存，正式册零增；历史合法批次仍留在册。
+        if row.get("maintenance_conflict"):
+            if conn.execute(
+                "SELECT id FROM sample_drafts WHERE sample_code=?",
+                (row["sample_code"],),
+            ).fetchone():
+                continue
+            conn.execute(
+                """INSERT INTO sample_drafts(sample_code,outfall_id,permit_ref,metrics,
+                   flow_m3h,status,reason,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    row["sample_code"],
+                    outfall,
+                    row["permit_ref"],
+                    json.dumps(row.get("metrics", {}), ensure_ascii=False),
+                    float(row["flow_m3h"]),
+                    "拒收封存",
+                    f"检修禁采：种子入库时厂态={plant_status}，"
+                    f"正式册拒写并当日封死（{row.get('created_at', '')[:10]}）",
+                    row.get("created_at", now_iso()),
+                ),
+            )
+            continue
         conn.execute(
             """INSERT INTO sample_batches(sample_code,outfall_id,permit_ref,metrics,flow_m3h,
-               generation,status,adjudicated_at,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               generation,status,maintenance_conflict,adjudicated_at,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 row["sample_code"],
                 outfall,
@@ -324,6 +382,7 @@ def seed_samples(conn: sqlite3.Connection) -> None:
                 float(row["flow_m3h"]),
                 int(row.get("generation", 1)),
                 row.get("status", "已裁定"),
+                1 if row.get("maintenance_conflict") else 0,
                 row.get("adjudicated_at"),
                 row.get("created_at", now_iso()),
             ),
@@ -442,6 +501,42 @@ def seed_lineage(conn: sqlite3.Connection) -> None:
         )
 
 
+def record_maintenance_decision(
+    conn: sqlite3.Connection,
+    plant_id: int,
+    plant_code: str,
+    decision: str,
+    note: str,
+    *,
+    plant_status: str | None = None,
+) -> None:
+    """检修禁采拍板：写入说明并当日封死（同日唯一，重复不覆盖首拍）。"""
+    day = now_iso()[:10]
+    if conn.execute(
+        "SELECT id FROM maintenance_decisions WHERE plant_id=? AND sealed_on=?",
+        (plant_id, day),
+    ).fetchone():
+        return
+    conn.execute(
+        """INSERT INTO maintenance_decisions(plant_id,plant_code,decision,decided_at,
+           sealed_on,note) VALUES (?,?,?,?,?,?)""",
+        (plant_id, plant_code, decision, now_iso(), day, note),
+    )
+    write_audit(
+        conn,
+        "系统",
+        "检修禁采拍板",
+        plant_code,
+        {
+            "decision": decision,
+            "note": note,
+            "plant_status": plant_status,
+            "sealed_on": day,
+            "formal_rows_added": 0,
+        },
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
@@ -454,6 +549,20 @@ def init_db() -> None:
         seed_releases(conn)
         seed_seals(conn)
         seed_lineage(conn)
+        # 检修禁采拍板写入说明并当日封死：库内每座检修厂各一盘。
+        for row in conn.execute(
+            "SELECT id, plant_code, status, maintenance_since FROM plants WHERE status!='运行'"
+        ).fetchall():
+            record_maintenance_decision(
+                conn,
+                row["id"],
+                row["plant_code"],
+                "检修禁采：厂态非运行期间采样写口拒写，正式排放册零增，"
+                "检修场景仅落拒收封存草稿、当日封死",
+                "东城厂检修禁采独验收：处理厂页检修灯与采样页新建按钮同屏互斥；"
+                "对账流量卡与排放口当日曲线剔除检修厂批次；总览检修计数与处理厂服务状态同值。",
+                plant_status=row["status"],
+            )
         conn.commit()
 
 
@@ -461,6 +570,21 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
     plants = conn.execute("SELECT COUNT(*) c FROM plants").fetchone()["c"]
     outfalls = conn.execute("SELECT COUNT(*) c FROM outfalls").fetchone()["c"]
     samples = conn.execute("SELECT COUNT(*) c FROM sample_batches").fetchone()["c"]
+    maintenance_plants = conn.execute(
+        "SELECT COUNT(*) c FROM plants WHERE status='检修'"
+    ).fetchone()["c"]
+    maintenance_plant_codes = [
+        r["plant_code"]
+        for r in conn.execute(
+            "SELECT plant_code FROM plants WHERE status='检修' ORDER BY id"
+        ).fetchall()
+    ]
+    maintenance_draft_count = conn.execute(
+        "SELECT COUNT(*) c FROM sample_drafts WHERE status='拒收封存'"
+    ).fetchone()["c"]
+    maintenance_decision_count = conn.execute(
+        "SELECT COUNT(*) c FROM maintenance_decisions"
+    ).fetchone()["c"]
     open_holds = conn.execute(
         "SELECT COUNT(*) c FROM exceed_holds WHERE status='开放'"
     ).fetchone()["c"]
@@ -491,6 +615,11 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
         "discharge_seals": sealed,
         "permits": permits,
         "side_pending": pending,
+        # 总览检修计数与处理厂服务状态字段同源（status='检修'）。
+        "maintenance_plants": maintenance_plants,
+        "maintenance_plant_codes": maintenance_plant_codes,
+        "maintenance_drafts": maintenance_draft_count,
+        "maintenance_decisions": maintenance_decision_count,
         "stubs": stubs,
         "meta": PRODUCT_META,
     }

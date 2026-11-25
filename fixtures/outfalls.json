@@ -48,5 +48,15 @@
     "tp_limit": 0.5,
     "status": "停用",
     "created_at": "2026-11-01T09:20:00"
+  },
+  {
+    "outfall_code": "OF-W2-B",
+    "plant_code": "PL-WEST-02",
+    "river_reach": "西湾备用渠",
+    "cod_limit": 50,
+    "nh3n_limit": 5,
+    "tp_limit": 0.5,
+    "status": "开放",
+    "created_at": "2026-11-01T09:12:00"
   }
 ]

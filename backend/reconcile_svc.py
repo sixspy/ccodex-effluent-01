@@ -40,17 +40,53 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
     permit = conn.execute(
         "SELECT * FROM discharge_permits WHERE permit_code=?", (permit_code,)
     ).fetchone()
-    samples = conn.execute(
-        """SELECT sample_code, flow_m3h, metrics, status, generation FROM sample_batches
-           WHERE permit_ref=? AND status NOT IN ('作废')""",
+    # 同源账实：流量卡只统计正式在册且非检修期批次；
+    # 检修期采样（当日及之后）即便残留册中也不得计入流量，另列 maintenance_excluded。
+    rows = conn.execute(
+        """SELECT s.sample_code, s.flow_m3h, s.metrics, s.status, s.generation,
+                  s.created_at, p.plant_code, p.status plant_status,
+                  p.maintenance_since
+           FROM sample_batches s
+           JOIN outfalls o ON o.id=s.outfall_id
+           JOIN plants p ON p.id=o.plant_id
+           WHERE s.permit_ref=? AND s.status NOT IN ('作废')""",
         (permit_code,),
     ).fetchall()
+    samples = []
+    maintenance_excluded = 0
+    for r in rows:
+        in_maint_window = (
+            r["plant_status"] == "检修"
+            and r["maintenance_since"]
+            and str(r["created_at"])[:10] >= str(r["maintenance_since"])[:10]
+        )
+        if in_maint_window:
+            maintenance_excluded += 1
+            continue
+        samples.append(r)
+    draft_rows = conn.execute(
+        """SELECT d.sample_code, d.status FROM sample_drafts d
+           WHERE d.permit_ref=?""",
+        (permit_code,),
+    ).fetchall()
+    maintenance_excluded += len(
+        [d for d in draft_rows if d["status"] == "拒收封存"]
+    )
+    flow_m3h_total = round(sum(float(s["flow_m3h"]) for s in samples), 3)
+    flow_m3d_total = round(flow_m3h_total * 24.0, 3)
     if not samples:
         return {
             "permit_code": permit_code,
-            "balanced": False,
-            "reason": "无采样批次",
+            "balanced": True,
+            "reason": "无正式在册采样批次",
+            "quota_m3d": permit["quota_m3d"],
+            "flow_m3h_total": 0.0,
+            "flow_m3d_total": 0.0,
+            "maintenance_excluded": maintenance_excluded,
             "samples": [],
+            "seals": [],
+            "seal_count": 0,
+            "proof_ready": False,
         }
     caps = {
         "cod": permit["cod_cap"],
@@ -71,6 +107,7 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
                 "sample_code": s["sample_code"],
                 "status": s["status"],
                 "generation": s["generation"],
+                "plant_code": s["plant_code"],
                 "metrics": metrics,
                 "flow_m3h": s["flow_m3h"],
                 "matched": ok,
@@ -89,6 +126,9 @@ def _reconcile_permit(conn, permit_code: str) -> dict:
         "balanced": all_ok,
         "proof_ready": all_ok and len(seal_rows) >= 1,
         "seal_count": len(seal_rows),
+        "flow_m3h_total": flow_m3h_total,
+        "flow_m3d_total": flow_m3d_total,
+        "maintenance_excluded": maintenance_excluded,
         "samples": details,
         "seals": [dict(x) for x in seal_rows],
     }

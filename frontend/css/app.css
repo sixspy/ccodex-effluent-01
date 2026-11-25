@@ -198,3 +198,21 @@ pre {
   max-height: 280px;
   overflow: auto;
 }
+.maint-lamp {
+  display: inline-block;
+  color: var(--danger);
+  font-weight: 600;
+  animation: maint-pulse 1.6s ease-in-out infinite;
+}
+@keyframes maint-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+button:disabled,
+button[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: var(--muted);
+  border-color: var(--muted);
+}
+.stat.warn .n { color: var(--danger); }

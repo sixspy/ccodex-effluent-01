@@ -33,15 +33,16 @@ def test_sample_exceed_release_seal_flow():
     c = TestClient(app)
     h = _auth(c)
     outfalls = c.get("/api/outfalls", headers=h).json()["items"]
-    of = next(x for x in outfalls if x["outfall_code"] == "OF-E1-A")
+    # 东城厂夹具为检修态（禁采），正常采样链路改走运行中的西湾厂。
+    of = next(x for x in outfalls if x["outfall_code"] == "OF-W2-A")
     created = c.post(
         "/api/samples",
         headers=h,
         json={
             "outfall_id": of["id"],
-            "permit_ref": "DP-2026-E01",
+            "permit_ref": "DP-2026-W02",
             "sample_code": "SM-FLOW-001",
-            "flow_m3h": 2000,
+            "flow_m3h": 1500,
             "metrics": {"cod": 62.0, "nh3n": 3.0, "tp": 0.2},
         },
     ).json()

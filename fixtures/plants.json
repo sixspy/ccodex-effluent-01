@@ -4,8 +4,9 @@
     "name": "东城水质净化中心",
     "basin": "东城河流域",
     "design_cap_m3d": 80000,
-    "status": "运行",
-    "created_at": "2026-11-01T08:00:00"
+    "status": "检修",
+    "created_at": "2026-11-01T08:00:00",
+    "maintenance_since": "2026-11-24T09:00:00"
   },
   {
     "plant_code": "PL-WEST-02",
@@ -29,6 +30,7 @@
     "basin": "南港感潮段",
     "design_cap_m3d": 35000,
     "status": "检修",
-    "created_at": "2026-11-01T08:15:00"
+    "created_at": "2026-11-01T08:15:00",
+    "maintenance_since": "2026-11-01T08:15:00"
   }
 ]

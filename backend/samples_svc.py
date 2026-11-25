@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import claim, release, require_lock
 from models import SampleIn
 from validators import (
     adjudicate_exceed,
@@ -15,10 +16,12 @@ from validators import (
     validate_flow_cap,
     validate_metrics_nonneg,
     validate_outfall_open,
-    validate_plant_running,
 )
 
 router = APIRouter(tags=["samples"])
+
+# 检修禁采口径：厂态非「运行」即禁采；检修厂新建采样当场拒写并封存草稿。
+MAINTENANCE_DRAFT_STATUS = "拒收封存"
 
 
 def _next_sample_code(conn, outfall_id: int) -> str:
@@ -32,11 +35,57 @@ def _next_sample_code(conn, outfall_id: int) -> str:
     return f"SM-{prefix}-{n + 1:03d}"
 
 
+def _draft_code(conn, code: str | None, outfall_id: int) -> str:
+    if code:
+        return code
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM sample_drafts WHERE outfall_id=?", (outfall_id,)
+    ).fetchone()["c"]
+    return f"DR-{outfall_id}-{n + 1:03d}"
+
+
+def _refuse_sampling(conn, user: str, outfall: dict, body: SampleIn, code: str) -> None:
+    """厂态非运行：正式册零增，写口当场拒写，草稿当日封死并记偏航。"""
+    plant_status = outfall["plant_status"]
+    metrics = body.metrics.model_dump()
+    reason = f"检修禁采：厂态={plant_status}，正式册拒写并封存待检草稿"
+    audit_action = "检修禁采偏航" if plant_status == "检修" else "非运行禁采偏航"
+    conn.execute(
+        """INSERT INTO sample_drafts(sample_code,outfall_id,permit_ref,metrics,flow_m3h,
+           status,reason,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            _draft_code(conn, code, body.outfall_id),
+            body.outfall_id,
+            body.permit_ref,
+            json.dumps(metrics, ensure_ascii=False),
+            body.flow_m3h,
+            MAINTENANCE_DRAFT_STATUS,
+            reason,
+            now_iso(),
+        ),
+    )
+    write_audit(
+        conn,
+        user,
+        audit_action,
+        outfall["outfall_code"],
+        {
+            "plant_code": outfall["plant_code"],
+            "plant_status": plant_status,
+            "sample_code": code,
+            "decision": reason,
+            "formal_rows_added": 0,
+        },
+    )
+    conn.commit()
+
+
 @router.get("/api/samples")
 def list_samples(authorization: AuthHeader = None, status: str | None = None):
     require_user(authorization)
     with connect() as conn:
-        q = """SELECT s.*, o.outfall_code, p.plant_code FROM sample_batches s
+        q = """SELECT s.*, o.outfall_code, p.plant_code, p.status plant_status
+               FROM sample_batches s
                JOIN outfalls o ON o.id=s.outfall_id
                JOIN plants p ON p.id=o.plant_id"""
         if status:
@@ -49,6 +98,7 @@ def list_samples(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["metrics"] = json.loads(d["metrics"] or "{}")
+            d["is_maintenance"] = d["plant_status"] == "检修"
             items.append(d)
         return {"items": items}
 
@@ -59,7 +109,7 @@ def get_sample(sample_id: int, authorization: AuthHeader = None):
     with connect() as conn:
         row = conn.execute(
             """SELECT s.*, o.outfall_code, o.cod_limit, o.nh3n_limit, o.tp_limit,
-                      p.name plant_name
+                      p.name plant_name, p.status plant_status
                FROM sample_batches s
                JOIN outfalls o ON o.id=s.outfall_id
                JOIN plants p ON p.id=o.plant_id
@@ -70,6 +120,7 @@ def get_sample(sample_id: int, authorization: AuthHeader = None):
             raise HTTPException(404, "采样批次不存在")
         data = dict(row)
         data["metrics"] = json.loads(data["metrics"] or "{}")
+        data["is_maintenance"] = data["plant_status"] == "检修"
         holds = conn.execute(
             "SELECT * FROM exceed_holds WHERE sample_id=? ORDER BY id DESC",
             (sample_id,),
@@ -93,19 +144,54 @@ def get_sample(sample_id: int, authorization: AuthHeader = None):
 @router.post("/api/samples")
 def create_sample(body: SampleIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    lock_key = f"outfall:{body.outfall_id}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        outfall = conn.execute(
+            """SELECT o.*, p.id plant_id, p.plant_code, p.status plant_status,
+                      p.design_cap_m3d
+               FROM outfalls o JOIN plants p ON p.id=o.plant_id WHERE o.id=?""",
+            (body.outfall_id,),
+        ).fetchone()
+        if not outfall:
+            raise HTTPException(404, "排放口不存在")
+
+        # 厂锁持有人按「会话请求」唯一化：同账号两路会话也必须互斥，不可当重入。
+        handle = f"{user}#{uuid.uuid4().hex[:12]}"
+        lock_key = f"plant:{outfall['plant_id']}"
+        ok, current = claim(conn, lock_key, handle)
+        if not ok:
+            # 争用核销与命运取舍分两段写：败方只留痕，不落采样行。
+            conn.execute(
+                """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (lock_key, user, "争用失败", f"持有人={current}", now_iso()),
+            )
+            write_audit(
+                conn,
+                user,
+                "争用核销",
+                lock_key,
+                {"holder": current, "result": "本路未取得厂锁"},
+            )
+            write_audit(
+                conn,
+                user,
+                "命运取舍",
+                lock_key,
+                {"decision": "败方只留痕不落采样行", "formal_rows_added": 0},
+            )
+            conn.commit()
+            raise HTTPException(409, f"同厂采样争用：{lock_key} 持有人 {current}")
         try:
-            outfall = conn.execute(
-                """SELECT o.*, p.status plant_status, p.design_cap_m3d
-                   FROM outfalls o JOIN plants p ON p.id=o.plant_id WHERE o.id=?""",
-                (body.outfall_id,),
-            ).fetchone()
-            if not outfall:
-                raise HTTPException(404, "排放口不存在")
+            # 厂态闸先于排口闸：检修厂一律当场拒写并留偏航痕，不受排口状态影响。
+            if outfall["plant_status"] != "运行":
+                code = body.sample_code or _next_sample_code(conn, body.outfall_id)
+                _refuse_sampling(conn, user, outfall, body, code)
+                raise HTTPException(
+                    403,
+                    f"检修禁采：{outfall['plant_code']} 厂态={outfall['plant_status']}，"
+                    "正式排放册拒写并当场封存",
+                )
             validate_outfall_open(outfall["status"])
-            validate_plant_running(outfall["plant_status"])
             metrics = body.metrics.model_dump()
             validate_metrics_nonneg(metrics)
             validate_flow_cap(body.flow_m3h, float(outfall["design_cap_m3d"]))
@@ -134,8 +220,8 @@ def create_sample(body: SampleIn, authorization: AuthHeader = None):
             adjudicated = None if exceeded else now_iso()
             cur = conn.execute(
                 """INSERT INTO sample_batches(sample_code,outfall_id,permit_ref,metrics,
-                   flow_m3h,generation,status,adjudicated_at,created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   flow_m3h,generation,status,maintenance_conflict,adjudicated_at,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     code,
                     body.outfall_id,
@@ -144,6 +230,7 @@ def create_sample(body: SampleIn, authorization: AuthHeader = None):
                     body.flow_m3h,
                     1,
                     status,
+                    0,
                     adjudicated,
                     now_iso(),
                 ),
@@ -189,5 +276,5 @@ def create_sample(body: SampleIn, authorization: AuthHeader = None):
                 "hold_key": hold,
             }
         finally:
-            release(conn, lock_key, user)
+            release(conn, lock_key, handle)
             conn.commit()

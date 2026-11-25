@@ -10,22 +10,28 @@ from models import OutfallIn
 router = APIRouter(tags=["outfalls"])
 
 
+def _today() -> str:
+    return now_iso()[:10]
+
+
 @router.get("/api/outfalls")
 def list_outfalls(authorization: AuthHeader = None, plant_id: int | None = None):
     require_user(authorization)
     with connect() as conn:
+        base = """SELECT o.*, p.plant_code, p.name plant_name, p.status plant_status
+                  FROM outfalls o JOIN plants p ON p.id=o.plant_id"""
         if plant_id:
             rows = conn.execute(
-                """SELECT o.*, p.plant_code, p.name plant_name FROM outfalls o
-                   JOIN plants p ON p.id=o.plant_id WHERE o.plant_id=? ORDER BY o.id""",
-                (plant_id,),
+                base + " WHERE o.plant_id=? ORDER BY o.id", (plant_id,)
             ).fetchall()
         else:
-            rows = conn.execute(
-                """SELECT o.*, p.plant_code, p.name plant_name FROM outfalls o
-                   JOIN plants p ON p.id=o.plant_id ORDER BY o.id"""
-            ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+            rows = conn.execute(base + " ORDER BY o.id").fetchall()
+        items = []
+        for r in rows:
+            d = dict(r)
+            d["is_maintenance"] = d["plant_status"] == "检修"
+            items.append(d)
+        return {"items": items}
 
 
 @router.get("/api/outfalls/{outfall_id}")
@@ -33,18 +39,47 @@ def get_outfall(outfall_id: int, authorization: AuthHeader = None):
     require_user(authorization)
     with connect() as conn:
         row = conn.execute(
-            """SELECT o.*, p.plant_code, p.design_cap_m3d FROM outfalls o
+            """SELECT o.*, p.plant_code, p.design_cap_m3d, p.status plant_status
+               FROM outfalls o
                JOIN plants p ON p.id=o.plant_id WHERE o.id=?""",
             (outfall_id,),
         ).fetchone()
         if not row:
             raise HTTPException(404, "排放口不存在")
+        is_maintenance = row["plant_status"] == "检修"
         recent = conn.execute(
-            """SELECT sample_code, status, flow_m3h, created_at FROM sample_batches
-               WHERE outfall_id=? ORDER BY id DESC LIMIT 10""",
-            (outfall_id,),
+            """SELECT sample_code, status, flow_m3h, creation_day FROM (
+                   SELECT sample_code, status, flow_m3h,
+                          substr(created_at,1,10) creation_day
+                   FROM sample_batches WHERE outfall_id=? ORDER BY id DESC
+               ) WHERE creation_day=? ORDER BY sample_code""",
+            (outfall_id, _today()),
         ).fetchall()
-        return {"outfall": dict(row), "recent_samples": [dict(s) for s in recent]}
+        excluded = conn.execute(
+            """SELECT COUNT(*) c FROM sample_drafts d
+               JOIN outfalls o ON o.id=d.outfall_id
+               WHERE o.id=? AND d.status='拒收封存'""",
+            (outfall_id,),
+        ).fetchone()["c"]
+        # 检修厂当日曲线一律剔除（草稿不入曲线），同源账实。
+        curve = []
+        if not is_maintenance:
+            curve = [
+                {
+                    "sample_code": s["sample_code"],
+                    "flow_m3h": s["flow_m3h"],
+                    "status": s["status"],
+                }
+                for s in recent
+            ]
+        outfall_payload = dict(row)
+        outfall_payload["is_maintenance"] = is_maintenance
+        return {
+            "outfall": outfall_payload,
+            "recent_samples": [] if is_maintenance else [dict(s) for s in recent],
+            "daily_curve": curve,
+            "maintenance_excluded": excluded,
+        }
 
 
 @router.post("/api/outfalls")
